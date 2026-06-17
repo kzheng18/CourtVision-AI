@@ -20,7 +20,7 @@ import pandas as pd
 
 def main():
     # Read video
-    input_video_path = "input_video/input_video.mp4"
+    input_video_path = "input_video/input_video_h264.mp4"
     video_frames = read_video(input_video_path)
     
     # Get video FPS
@@ -40,18 +40,24 @@ def main():
         stub_path="tracker_stubs/player_detection.pkl"
     )
 
-    # Track ball
-    ball_tracker = BallTracker(model_path="models/last_model_3.pt")
-    ball_detections = ball_tracker.detect_frames(
-        video_frames, 
-        read_from_stub=True, 
-        stub_path="tracker_stubs/ball_detection.pkl"
-    )
-    ball_detections = ball_tracker.interpolate_ball_positions(ball_detections)
-
-    # Detect court
+    # Detect court first — keypoints needed to filter ball detections
     court_line_detector = CourtLineDetector(model_path="models/keypoints_model_50.pth")
     court_keypoints = court_line_detector.predict(video_frames[0])
+
+    # Track ball
+    ball_tracker = BallTracker(tracknet_path="models/tracknet_v4_best.pt")
+    ball_detections = ball_tracker.detect_frames(
+        video_frames,
+        read_from_stub=True,
+        stub_path="tracker_stubs/ball_detection.pkl"
+    )
+    ball_detections = ball_tracker.remove_spikes(ball_detections)
+    ball_detections = ball_tracker.remove_static_locks(ball_detections)
+    ball_detections = ball_tracker.apply_optical_flow_fill(ball_detections, video_frames)
+    frame_shape = video_frames[0].shape[:2]  # (H, W)
+    ball_detections = ball_tracker.apply_kalman_smoothing(
+        ball_detections, frame_shape=frame_shape, court_keypoints=court_keypoints
+    )
 
     # Filter players
     player_detections = player_tracker.choose_and_filter_players(court_keypoints, player_detections)
@@ -83,13 +89,12 @@ def main():
         bounce_frame_1 = bounce_frame['frame']
         if bounce_frame_1 < len(ball_mini_court_detections) and 1 in ball_mini_court_detections[bounce_frame_1]:
             bounce_position = ball_mini_court_detections[bounce_frame_1][1]
-            
-            # Determine if bounce is in bounds
-            in_bounds = is_bounce_in_bounds(bounce_position, mini_court)
-            
-            # Add to mini court history
+
+            # Use the in-bounds result from detect_ball_bounces (uses video coords — more accurate)
+            in_bounds = bounce_frame['is_in_bounds']
+
             mini_court.add_bounce_position(bounce_position, in_bounds, bounce_frame_1)
-            
+
             result = "IN" if in_bounds else "OUT"
             print(f"  Bounce at frame {bounce_frame_1}: {result}")
     

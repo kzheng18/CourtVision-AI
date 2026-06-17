@@ -251,82 +251,41 @@ class MiniCourt():
 
         return  mini_court_player_position
     
+    def _build_homography(self, court_keypoints):
+        """
+        Compute perspective transform from video court corners to mini court corners.
+        Uses the 4 outer court corners (keypoints 0-3) which define the trapezoid
+        of the full doubles court as seen from the broadcast camera angle.
+        """
+        src = np.float32([
+            [court_keypoints[0], court_keypoints[1]],  # KP 0: far-left corner
+            [court_keypoints[2], court_keypoints[3]],  # KP 1: far-right corner
+            [court_keypoints[4], court_keypoints[5]],  # KP 2: near-left corner
+            [court_keypoints[6], court_keypoints[7]],  # KP 3: near-right corner
+        ])
+        dst = np.float32([
+            [self.drawing_key_points[0], self.drawing_key_points[1]],  # mini top-left
+            [self.drawing_key_points[2], self.drawing_key_points[3]],  # mini top-right
+            [self.drawing_key_points[4], self.drawing_key_points[5]],  # mini bottom-left
+            [self.drawing_key_points[6], self.drawing_key_points[7]],  # mini bottom-right
+        ])
+        H, _ = cv2.findHomography(src, dst)
+        return H
+
     def convert_point_to_mini_court(self, point, original_court_keypoints):
         """
-        Convert point using proportional mapping with perspective correction.
-        Corrects both Y (vertical) and X (horizontal) perspective distortion.
+        Map a video pixel to mini court pixel using a perspective homography.
+        Correctly handles camera perspective — the court is a trapezoid in video.
         """
-        
-        # Get baseline positions (actual court lines)
-        baseline_left = min(original_court_keypoints[0], original_court_keypoints[4])
-        baseline_right = max(original_court_keypoints[2], original_court_keypoints[6])
-        baseline_top = min(original_court_keypoints[1], original_court_keypoints[3])
-        baseline_bottom = max(original_court_keypoints[5], original_court_keypoints[7])
-        
-        court_width = baseline_right - baseline_left
-        court_height = baseline_bottom - baseline_top
-        court_center_y = (baseline_top + baseline_bottom) / 2
-        
-        # Add buffer for behind-baseline area
-        buffer_percent = 0.15
-        vertical_buffer = court_height * buffer_percent
-        
-        # Extended court bounds
-        court_left = baseline_left
-        court_right = baseline_right  
-        court_top = baseline_top - vertical_buffer
-        court_bottom = baseline_bottom + vertical_buffer
-        
-        court_width_full = court_right - court_left
-        court_height_full = court_bottom - court_top
-        
-        # Calculate point's position as percentage
-        if court_width_full > 0:
-            x_percent = (point[0] - court_left) / court_width_full
-        else:
-            x_percent = 0.5
-            
-        if court_height_full > 0:
-            y_percent = (point[1] - court_top) / court_height_full
-        else:
-            y_percent = 0.5
-        
-        
-        # Bottom of court appears wider due to camera angle
-        # Need to compress X more for points at the bottom
+        key = id(original_court_keypoints) if not isinstance(original_court_keypoints, np.ndarray) \
+              else original_court_keypoints.tobytes()
+        if not hasattr(self, '_homography') or self._homography_key != key:
+            self._homography = self._build_homography(original_court_keypoints)
+            self._homography_key = key
 
-        y_percent_corrected = y_percent ** 1
-        
-        depth_factor = y_percent
-        
-        # Apply horizontal compression based on depth
-        # Points at bottom (depth_factor = 1) get pulled toward center
-        # Points at top (depth_factor = 0) stay as-is
-        
-        # Amount to pull toward center (0 = no pull, higher = more pull)
-        horizontal_compression = 0.05  # Adjust this value (0.03-0.10)
-        
-        # Pull X toward center based on depth
-        x_offset = (x_percent - 0.5) * depth_factor * horizontal_compression
-        x_percent_corrected = x_percent - x_offset
-        
-        # Clamp to 0-1 range
-        x_percent_corrected = max(0.0, min(1.0, x_percent_corrected))
-        y_percent_corrected = max(0.0, min(1.0, y_percent_corrected))
-        
-        # Apply to mini court
-        mini_court_left = self.drawing_key_points[0]
-        mini_court_right = self.drawing_key_points[2]
-        mini_court_top = self.drawing_key_points[1]
-        mini_court_bottom = self.drawing_key_points[5]
-        
-        mini_court_width = mini_court_right - mini_court_left
-        mini_court_height = mini_court_bottom - mini_court_top
-        
-        mini_x = mini_court_left + (x_percent_corrected * mini_court_width)
-        mini_y = mini_court_top + (y_percent_corrected * mini_court_height)
-        
-        return (int(mini_x), int(mini_y))
+        pt = np.float32([[[point[0], point[1]]]])
+        transformed = cv2.perspectiveTransform(pt, self._homography)
+        return (int(transformed[0][0][0]), int(transformed[0][0][1]))
     
     def convert_bounding_boxes_to_mini_court_coordinates(self, player_boxes, ball_boxes, original_court_key_points):
         player_heights = {
@@ -338,6 +297,10 @@ class MiniCourt():
         output_ball_boxes= []
 
         for frame_num, player_bbox in enumerate(player_boxes):
+            if 1 not in ball_boxes[frame_num] or not player_bbox:
+                output_player_boxes.append({})
+                output_ball_boxes.append({})
+                continue
             ball_box = ball_boxes[frame_num][1]
             ball_position = get_center_bbox(ball_box)
             closest_player_id_to_ball = min(player_bbox.keys(), key=lambda x: measure_distance(ball_position, get_center_bbox(player_bbox[x])))

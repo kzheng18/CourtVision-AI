@@ -5,19 +5,31 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
         print("   ⚠️ Need at least 2 shots\n")
         return []
     
-    # X bounds: use top singles lines (keypoints 4 and 6)
-    singles_left = court_keypoints[4 * 2]   
-    singles_right = court_keypoints[6 * 2]  
-    
+    # Singles sideline corners for perspective-correct x interpolation
+    # pt4 (kp[8,9]): top-left singles | pt5 (kp[10,11]): bottom-left singles
+    # pt6 (kp[12,13]): top-right singles | pt7 (kp[14,15]): bottom-right singles
+    kp = court_keypoints
+    sl_ltx, sl_lty = kp[8],  kp[9]
+    sl_lbx, sl_lby = kp[10], kp[11]
+    sl_rtx, sl_rty = kp[12], kp[13]
+    sl_rbx, sl_rby = kp[14], kp[15]
+
+    def singles_x_at_y(cy):
+        t = max(0.0, min(1.0, (cy - sl_lty) / (sl_lby - sl_lty + 1e-6)))
+        return sl_ltx + t * (sl_lbx - sl_ltx), sl_rtx + t * (sl_rbx - sl_rtx)
+
     # Y bounds: use the full court length (same for singles and doubles)
-    court_top = min(court_keypoints[0 * 2 + 1], court_keypoints[1 * 2 + 1])   
+    court_top = min(court_keypoints[0 * 2 + 1], court_keypoints[1 * 2 + 1])
     court_bottom = max(court_keypoints[2 * 2 + 1], court_keypoints[3 * 2 + 1])
-    
+
     court_height = court_bottom - court_top
     court_center_y = (court_top + court_bottom) / 2
-    
-    print(f"   Singles court bounds:")
-    print(f"   X: {singles_left:.0f} to {singles_right:.0f}")
+
+    left_top, right_top = singles_x_at_y(court_top)
+    left_bot, right_bot = singles_x_at_y(court_bottom)
+    print(f"   Singles court bounds (perspective-correct):")
+    print(f"   X at top: {left_top:.0f} to {right_top:.0f}")
+    print(f"   X at bottom: {left_bot:.0f} to {right_bot:.0f}")
     print(f"   Y: {court_top:.0f} to {court_bottom:.0f}\n")
     
     # Build position lookup
@@ -45,9 +57,9 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
         print(f"  Bounce {shot_idx + 1}: Between shots at frames {shot_frame} and {next_shot}")
         print(f"      Player in {'TOP' if player_in_top else 'BOTTOM'} half")
         
-        # Search for bounce
-        search_start = shot_frame + 10
-        search_end = next_shot - 10
+        # Search for bounce — use 5-frame margin to handle short rally intervals
+        search_start = shot_frame + 5
+        search_end = next_shot - 5
         
         trajectory = []
         for f in range(search_start, search_end + 1):
@@ -68,27 +80,34 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
         else:
             bounce = min(trajectory, key=lambda p: p['y'])
                 
-        # Horizontal: must be within singles lines
-        x_in_bounds = singles_left <= bounce['x'] <= singles_right
-        
-        # Vertical: with margin for behind baseline
-        margin = court_height * 0.10
-        
+        # Horizontal: perspective-correct singles sideline at this bounce y.
+        # 20px tolerance accounts for keypoint model error (~17cm real-world).
+        left_x, right_x = singles_x_at_y(bounce['y'])
+        x_tolerance = 35
+        x_in_bounds = (left_x - x_tolerance) <= bounce['x'] <= (right_x + x_tolerance)
+
+        # Vertical bounds: baseline gets a physical margin; net/center gets a
+        # larger tolerance (it is not a physical bounce line — tracking errors
+        # near the center of the court should not be called OUT).
+        baseline_margin = court_height * 0.10
+        center_tolerance = 35
+
         if player_in_top:
-            y_min = court_center_y
-            y_max = court_bottom + margin
+            y_min = court_center_y - center_tolerance
+            y_max = court_bottom + baseline_margin
         else:
-            y_min = court_top - margin
-            y_max = court_center_y
-        
+            y_min = court_top - baseline_margin
+            y_max = court_center_y + center_tolerance
+
         y_in_bounds = y_min <= bounce['y'] <= y_max
-        
+
         is_in_bounds = x_in_bounds and y_in_bounds
-        
+
         # Debug
         if not x_in_bounds:
-            side = "LEFT" if bounce['x'] < singles_left else "RIGHT"
-            print(f"      ⚠️ OUT: Ball at X={bounce['x']:.0f} is {side} of singles line")
+            side = "LEFT" if bounce['x'] < (left_x - x_tolerance) else "RIGHT"
+            print(f"      ⚠️ OUT: Ball at X={bounce['x']:.0f} is {side} of singles line "
+                  f"(bounds ±{x_tolerance}px: {left_x - x_tolerance:.0f}–{right_x + x_tolerance:.0f})")
         
         if not y_in_bounds:
             print(f"      ⚠️ OUT: Ball at Y={bounce['y']:.0f} outside range [{y_min:.0f}, {y_max:.0f}]")
@@ -122,48 +141,67 @@ def get_ball_shots(ball_detections, video_fps=50):
     # Extract ball positions
     ball_positions = [x.get(1, []) for x in ball_detections]
     df = pd.DataFrame(ball_positions, columns=['x1', 'y1', 'x2', 'y2'])
-    
+
     # Interpolate missing values
     df = df.interpolate()
     df = df.bfill()
-    
-    # Calculate ball center Y position
+
+    # Ball center in both axes
     df['mid_y'] = (df['y1'] + df['y2']) / 2
-    
-    # Apply rolling mean to smooth trajectory
-    df['mid_y_rolling_mean'] = df['mid_y'].rolling(window=5, min_periods=1, center=False).mean()
-    
-    # Calculate velocity (change in Y position)
-    df['delta_y'] = df['mid_y_rolling_mean'].diff()
-    
-    # Initialize hit detection
+    df['mid_x'] = (df['x1'] + df['x2']) / 2
+
+    # Smooth trajectory
+    df['mid_y_rolling'] = df['mid_y'].rolling(window=5, min_periods=1, center=False).mean()
+    df['mid_x_rolling'] = df['mid_x'].rolling(window=5, min_periods=1, center=False).mean()
+
+    # Velocity in both axes
+    df['delta_y'] = df['mid_y_rolling'].diff()
+    df['delta_x'] = df['mid_x_rolling'].diff()
+
     df['ball_hit'] = 0
     minimum_change_frames_for_hit = 13
-    
-    # Detect velocity direction changes (shots)
+    # X-only reversals need a stricter threshold to avoid bounce false positives
+    # (bounces reverse Y but not X; hits reverse both or just Y/X depending on direction)
+    x_only_threshold = minimum_change_frames_for_hit + 2
+
     for i in range(60, len(df) - int(minimum_change_frames_for_hit * 1.2)):
-        # Check if velocity changes from positive to negative or vice versa
-        negative_change = df['delta_y'].iloc[i] > 0 and df['delta_y'].iloc[i+1] < 0
-        positive_change = df['delta_y'].iloc[i] < 0 and df['delta_y'].iloc[i+1] > 0
-        
-        if negative_change or positive_change:
-            change_count = 0
-            
-            # Verify the direction change persists
-            for change_frame in range(i+1, i + int(minimum_change_frames_for_hit * 1.2) + 1):
-                negative_following = df['delta_y'].iloc[i] > 0 and df['delta_y'].iloc[change_frame] < 0
-                positive_following = df['delta_y'].iloc[i] < 0 and df['delta_y'].iloc[change_frame] > 0
-                
-                if (negative_change and negative_following) or (positive_change and positive_following):
-                    change_count += 1
-            
-            # If change persists for minimum frames, mark as shot
-            if change_count > minimum_change_frames_for_hit - 1:
-                df.loc[i, 'ball_hit'] = 1
+        neg_y = df['delta_y'].iloc[i] > 0 and df['delta_y'].iloc[i+1] < 0
+        pos_y = df['delta_y'].iloc[i] < 0 and df['delta_y'].iloc[i+1] > 0
+        neg_x = df['delta_x'].iloc[i] > 0 and df['delta_x'].iloc[i+1] < 0
+        pos_x = df['delta_x'].iloc[i] < 0 and df['delta_x'].iloc[i+1] > 0
+
+        y_reversal = neg_y or pos_y
+        x_reversal = neg_x or pos_x
+
+        if not (y_reversal or x_reversal):
+            continue
+
+        y_count = 0
+        x_count = 0
+        for cf in range(i + 1, i + int(minimum_change_frames_for_hit * 1.2) + 1):
+            if (neg_y and df['delta_y'].iloc[cf] < 0) or (pos_y and df['delta_y'].iloc[cf] > 0):
+                y_count += 1
+            if (neg_x and df['delta_x'].iloc[cf] < 0) or (pos_x and df['delta_x'].iloc[cf] > 0):
+                x_count += 1
+
+        # Y reversal with standard threshold catches most shots and bounces (filtered by caller)
+        # X-only reversal with stricter threshold catches flat crosscourt shots
+        if y_count > minimum_change_frames_for_hit - 1:
+            df.loc[i, 'ball_hit'] = 1
+        elif x_count > x_only_threshold - 1:
+            df.loc[i, 'ball_hit'] = 1
     
     # Extract shot frames
-    shot_frames = df[df['ball_hit'] == 1].index.tolist()
-    
+    raw_shot_frames = df[df['ball_hit'] == 1].index.tolist()
+
+    # Filter out shots that are impossibly close together — these are detection
+    # noise, not real hits. Minimum ~10 frames apart at 50 fps ≈ 0.2 s.
+    min_interval = max(8, int(video_fps * 0.18))
+    shot_frames = []
+    for frame in raw_shot_frames:
+        if not shot_frames or (frame - shot_frames[-1]) >= min_interval:
+            shot_frames.append(frame)
+
     # Display results
     print(f"📊 Results:")
     print(f"   Total frames: {len(df)}")

@@ -1,0 +1,48 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Model weights (download / train separately) ───────────────────────────────
+models/*.pt
+models/*.pth
+# yolo12n.pt kept for player tracking — small enough to commit
+!yolo12n.pt
+
+# ── Videos & raw input ────────────────────────────────────────────────────────
+input_video/
+output_video/
+tennis_dataset/
+
+# ── Training data & zips ──────────────────────────────────────────────────────
+training_data/
+tracknet_training_data*.zip
+
+# ── Tracker stubs (generated cache — regenerated at runtime) ──────────────────
+tracker_stubs/*.pkl
+
+# ── Environment & secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+*.env
+secrets.py
+credentials.json
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+
+# ── Claude Code session files ─────────────────────────────────────────────────
+.claude/
