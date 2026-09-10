@@ -1,32 +1,120 @@
+import numpy as np
 import pandas as pd
+from .court_geometry import (
+    build_court_homography, to_court_meters, is_in_singles,
+    SINGLES_LEFT_M, SINGLES_RIGHT_M, COURT_LENGTH_M, COURT_WIDTH_M,
+)
 
-def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):    
+
+def _keypoints_for_frame(court_keypoints, frame_num):
+    """Select the matching calibration from either a flat or temporal array."""
+    keypoints = np.asarray(court_keypoints)
+    if keypoints.ndim == 2:
+        return keypoints[min(max(int(frame_num), 0), len(keypoints) - 1)]
+    return keypoints
+
+
+def _has_finite_keypoints(keypoints):
+    values = np.asarray(keypoints)
+    return values.size >= 28 and bool(np.all(np.isfinite(values[:28])))
+
+
+def _local_track_rms(ball_detections, frame, w=5):
+    """
+    RMS residual of the ball's local trajectory from a quadratic fit — a
+    tracking-quality signal at a candidate bounce.
+
+    Ground-truthed on the test clip: line calls that a human verified correct
+    sat on ~14 px RMS trajectories, while phantom far-court OUT calls sat on
+    >200 px RMS garbage (the tracker jumping frame-to-frame). A bounce on noisy
+    tracking yields an unverifiable call and should be abstained on.
+    """
+    ts, xs, ys = [], [], []
+    for f in range(frame - w, frame + w + 1):
+        if 0 <= f < len(ball_detections) and 1 in ball_detections[f]:
+            b = ball_detections[f][1]
+            ts.append(f); xs.append((b[0] + b[2]) / 2.0); ys.append((b[1] + b[3]) / 2.0)
+    if len(ts) < 5:
+        return None
+    ts = np.array(ts, dtype=np.float64)
+    rx = np.array(xs) - np.polyval(np.polyfit(ts, xs, 2), ts)
+    ry = np.array(ys) - np.polyval(np.polyfit(ts, ys, 2), ts)
+    return float(np.sqrt(np.mean(rx * rx + ry * ry)))
+
+
+def _refine_bounce(trajectory, ext_i, player_in_top, window=3):
+    """
+    Sub-frame bounce refinement.
+
+    From behind the baseline the ball moves only a pixel or two per frame near
+    the far baseline, so the raw y-extremum frame is a plateau and sensitive to
+    a single noisy detection. Fit a parabola y(f) to a small window of frames
+    around the extremum and take its vertex; interpolate x there. Falls back to
+    the raw extremum point whenever the fit is degenerate or points the wrong
+    way (wrong concavity, or vertex outside the window).
+    """
+    lo = max(0, ext_i - window)
+    hi = min(len(trajectory), ext_i + window + 1)
+    pts = trajectory[lo:hi]
+    if len(pts) < 3:
+        return trajectory[ext_i]
+
+    fs = np.array([p['frame'] for p in pts], dtype=np.float64)
+    ys = np.array([p['y'] for p in pts], dtype=np.float64)
+    try:
+        a, b, c = np.polyfit(fs, ys, 2)
+    except Exception:
+        return trajectory[ext_i]
+
+    if abs(a) < 1e-6:
+        return trajectory[ext_i]
+    f_star = -b / (2.0 * a)
+    if f_star < fs[0] or f_star > fs[-1]:
+        return trajectory[ext_i]
+    # Concavity must match: top player's shot bounces at a y-max (a<0),
+    # bottom player's at a y-min (a>0). Otherwise this vertex is the apex, not
+    # the bounce — keep the raw extremum.
+    if (player_in_top and a >= 0) or (not player_in_top and a <= 0):
+        return trajectory[ext_i]
+
+    xs = np.array([p['x'] for p in pts], dtype=np.float64)
+    return {
+        'frame': int(round(f_star)),
+        'x': float(np.interp(f_star, fs, xs)),
+        'y': float(a * f_star ** 2 + b * f_star + c),
+    }
+
+def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
     if not ball_shot_frames or len(ball_shot_frames) < 2:
         print("   ⚠️ Need at least 2 shots\n")
         return []
-    
-    # Singles sideline corners for perspective-correct x interpolation
-    # pt4 (kp[8,9]): top-left singles | pt5 (kp[10,11]): bottom-left singles
-    # pt6 (kp[12,13]): top-right singles | pt7 (kp[14,15]): bottom-right singles
-    kp = court_keypoints
-    sl_ltx, sl_lty = kp[8],  kp[9]
-    sl_lbx, sl_lby = kp[10], kp[11]
-    sl_rtx, sl_rty = kp[12], kp[13]
-    sl_rbx, sl_rby = kp[14], kp[15]
 
-    def singles_x_at_y(cy):
+    all_keypoints = np.asarray(court_keypoints)
+    if all_keypoints.ndim == 2:
+        finite_rows = np.all(np.isfinite(all_keypoints[:, :28]), axis=1)
+        if not np.any(finite_rows):
+            print("   ⚠️ No valid court calibration for bounce detection\n")
+            return []
+        reference_keypoints = all_keypoints[np.flatnonzero(finite_rows)[0]]
+    else:
+        reference_keypoints = all_keypoints
+
+    def singles_x_at_y(keypoints, cy):
+        # Pixel-space fallback for a frame whose metric homography is invalid.
+        sl_ltx, sl_lty = keypoints[8], keypoints[9]
+        sl_lbx, sl_lby = keypoints[10], keypoints[11]
+        sl_rtx, sl_rty = keypoints[12], keypoints[13]
+        sl_rbx, sl_rby = keypoints[14], keypoints[15]
         t = max(0.0, min(1.0, (cy - sl_lty) / (sl_lby - sl_lty + 1e-6)))
         return sl_ltx + t * (sl_lbx - sl_ltx), sl_rtx + t * (sl_rbx - sl_rtx)
 
-    # Y bounds: use the full court length (same for singles and doubles)
-    court_top = min(court_keypoints[0 * 2 + 1], court_keypoints[1 * 2 + 1])
-    court_bottom = max(court_keypoints[2 * 2 + 1], court_keypoints[3 * 2 + 1])
+    court_top = min(reference_keypoints[1], reference_keypoints[3])
+    court_bottom = max(reference_keypoints[5], reference_keypoints[7])
 
     court_height = court_bottom - court_top
-    court_center_y = (court_top + court_bottom) / 2
 
-    left_top, right_top = singles_x_at_y(court_top)
-    left_bot, right_bot = singles_x_at_y(court_bottom)
+    left_top, right_top = singles_x_at_y(reference_keypoints, court_top)
+    left_bot, right_bot = singles_x_at_y(reference_keypoints, court_bottom)
     print(f"   Singles court bounds (perspective-correct):")
     print(f"   X at top: {left_top:.0f} to {right_top:.0f}")
     print(f"   X at bottom: {left_bot:.0f} to {right_bot:.0f}")
@@ -52,7 +140,21 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
         if shot_frame not in ball_pos:
             continue
         
-        player_in_top = ball_pos[shot_frame]['y'] < court_center_y
+        shot_keypoints = _keypoints_for_frame(court_keypoints, shot_frame)
+        if not _has_finite_keypoints(shot_keypoints):
+            print(f"  Bounce {shot_idx + 1}: skipped — court calibration lost at shot frame")
+            continue
+        shot_homography = build_court_homography(shot_keypoints)
+        if shot_homography is not None:
+            _, shot_y_m = to_court_meters(
+                shot_homography,
+                (ball_pos[shot_frame]['x'], ball_pos[shot_frame]['y']),
+            )
+            player_in_top = shot_y_m < COURT_LENGTH_M / 2
+        else:
+            shot_top = min(shot_keypoints[1], shot_keypoints[3])
+            shot_bottom = max(shot_keypoints[5], shot_keypoints[7])
+            player_in_top = ball_pos[shot_frame]['y'] < (shot_top + shot_bottom) / 2
         
         print(f"  Bounce {shot_idx + 1}: Between shots at frames {shot_frame} and {next_shot}")
         print(f"      Player in {'TOP' if player_in_top else 'BOTTOM'} half")
@@ -74,45 +176,74 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
             print(f"      ⚠️ Not enough points\n")
             continue
         
-        # Find where ball is closest to ground
+        # Turning point = frame where the ball is closest to the ground, i.e.
+        # the vertical-image extremum. Refined to sub-frame precision below.
         if player_in_top:
-            bounce = max(trajectory, key=lambda p: p['y'])
+            ext_i = max(range(len(trajectory)), key=lambda k: trajectory[k]['y'])
         else:
-            bounce = min(trajectory, key=lambda p: p['y'])
-                
-        # Horizontal: perspective-correct singles sideline at this bounce y.
-        # 20px tolerance accounts for keypoint model error (~17cm real-world).
-        left_x, right_x = singles_x_at_y(bounce['y'])
-        x_tolerance = 35
-        x_in_bounds = (left_x - x_tolerance) <= bounce['x'] <= (right_x + x_tolerance)
+            ext_i = min(range(len(trajectory)), key=lambda k: trajectory[k]['y'])
+        bounce = _refine_bounce(trajectory, ext_i, player_in_top)
 
-        # Vertical bounds: baseline gets a physical margin; net/center gets a
-        # larger tolerance (it is not a physical bounce line — tracking errors
-        # near the center of the court should not be called OUT).
-        baseline_margin = court_height * 0.10
-        center_tolerance = 35
+        # Tracking-quality gate. A bounce sitting on jumpy tracking gives an
+        # unverifiable line call — measured on labelled data, verified-correct
+        # calls had ~14 px local RMS while phantom OUT calls had >200 px.
+        # Abstain rather than emit a coin-flip call.
+        track_rms = _local_track_rms(ball_detections, bounce['frame'])
+        if track_rms is not None and track_rms > 50.0:
+            print(f"      ⏭️  bounce on noisy tracking (local RMS {track_rms:.0f}px); "
+                  f"skipping line call")
+            continue
 
-        if player_in_top:
-            y_min = court_center_y - center_tolerance
-            y_max = court_bottom + baseline_margin
+        # In/out via court-plane homography: project the bounce point to real
+        # court meters and test the singles rectangle. One physically-meaningful
+        # check (margin in meters) replaces the pixel-sideline interpolation and
+        # the assorted magic pixel tolerances.
+        bounce_keypoints = _keypoints_for_frame(court_keypoints, bounce['frame'])
+        if not _has_finite_keypoints(bounce_keypoints):
+            print(f"      ⏭️  court calibration lost at frame {bounce['frame']}; skipping line call")
+            continue
+        H = build_court_homography(bounce_keypoints)
+        bx_m, by_m = None, None
+        if H is not None:
+            bx_m, by_m = to_court_meters(H, (bounce['x'], bounce['y']))
+
+            # Plausibility guard. A real bounce lands on or just outside the
+            # lines; a projection several meters off-court is not an OUT ball
+            # but an AIRBORNE point — typically the ball's apex over the far
+            # court, where tracking is sparsest — mistaken for a bounce. Skip
+            # it rather than emitting a phantom OUT call.
+            OFFCOURT_M = 2.5
+            if (by_m < -OFFCOURT_M or by_m > COURT_LENGTH_M + OFFCOURT_M or
+                    bx_m < -OFFCOURT_M or bx_m > COURT_WIDTH_M + OFFCOURT_M):
+                print(f"      ⏭️  unreliable bounce at ({bx_m:.1f}m, {by_m:.1f}m) — "
+                      f"off-court projection (airborne/mistracked); skipping")
+                continue
+
+            # A legal return must land on the opponent's side of the net. The
+            # full singles rectangle alone would incorrectly mark a mistaken
+            # extremum in the hitter's own half as IN.
+            lands_in_opponent_half = (
+                by_m >= COURT_LENGTH_M / 2
+                if player_in_top
+                else by_m <= COURT_LENGTH_M / 2
+            )
+            if not lands_in_opponent_half:
+                print(f"      ⏭️  unreliable bounce at court ({bx_m:.2f}m, {by_m:.2f}m) — "
+                      "extremum remained in hitter's half; skipping")
+                continue
+
+            is_in_bounds = is_in_singles(bx_m, by_m)
+            if not is_in_bounds:
+                print(f"      ⚠️ OUT: bounce at court ({bx_m:.2f}m, {by_m:.2f}m) — outside singles")
         else:
-            y_min = court_top - baseline_margin
-            y_max = court_center_y + center_tolerance
+            # Do not manufacture a line call from image-space midpoints when
+            # the court plane itself failed validation.
+            print(f"      ⏭️  invalid court homography at frame {bounce['frame']}; skipping line call")
+            continue
 
-        y_in_bounds = y_min <= bounce['y'] <= y_max
-
-        is_in_bounds = x_in_bounds and y_in_bounds
-
-        # Debug
-        if not x_in_bounds:
-            side = "LEFT" if bounce['x'] < (left_x - x_tolerance) else "RIGHT"
-            print(f"      ⚠️ OUT: Ball at X={bounce['x']:.0f} is {side} of singles line "
-                  f"(bounds ±{x_tolerance}px: {left_x - x_tolerance:.0f}–{right_x + x_tolerance:.0f})")
-        
-        if not y_in_bounds:
-            print(f"      ⚠️ OUT: Ball at Y={bounce['y']:.0f} outside range [{y_min:.0f}, {y_max:.0f}]")
-        
-        height_ratio = (bounce['y'] - court_top) / court_height
+        frame_top = min(bounce_keypoints[1], bounce_keypoints[3])
+        frame_bottom = max(bounce_keypoints[5], bounce_keypoints[7])
+        height_ratio = (bounce['y'] - frame_top) / max(frame_bottom - frame_top, 1e-6)
         status = "IN ✅" if is_in_bounds else "OUT ❌"
         
         print(f"      Found at: Frame {bounce['frame']}, "
@@ -122,6 +253,8 @@ def detect_ball_bounces(ball_detections, ball_shot_frames, court_keypoints):
             'frame': bounce['frame'],
             'x': bounce['x'],
             'y': bounce['y'],
+            'x_m': bx_m,          # court-plane meters (None if court degenerate)
+            'y_m': by_m,
             'shot_idx': shot_idx,
             'height_ratio': height_ratio,
             'player_side': 'top' if player_in_top else 'bottom',
@@ -233,41 +366,57 @@ def get_ball_shots(ball_detections, video_fps=50):
     return shot_frames
 
 
-def calculate_ball_distance(ball_start, ball_end, court_keypoints):
-    """Calculate ball distance with light perspective correction"""
+def calculate_ball_distance(ball_start, ball_end, court_keypoints, end_court_keypoints=None):
+    """
+    Real-world ball displacement between two frames, in meters.
+
+    Both endpoints are projected onto the court plane with a single homography
+    solved from the four doubles corners, so the distance is a true metric
+    distance — no per-frame perspective fudge factor. This assumes the points
+    lie on the court plane; for a mid-air ball there is residual parallax, the
+    same limitation the previous pixel-scale method had, but the magic 1.10
+    factor and the separate x/y scaling are gone.
+
+    Falls back to the old pixel-scale estimate only if the court corners are
+    degenerate and no homography can be solved.
+    """
+    from .court_geometry import build_court_homography, to_court_meters
+
+    start_homography = build_court_homography(court_keypoints)
+    end_homography = build_court_homography(
+        court_keypoints if end_court_keypoints is None else end_court_keypoints
+    )
+    if start_homography is not None and end_homography is not None:
+        sx, sy = to_court_meters(start_homography, ball_start)
+        ex, ey = to_court_meters(end_homography, ball_end)
+        dx_m_signed = ex - sx
+        dy_m_signed = ey - sy
+        distance_m = (dx_m_signed ** 2 + dy_m_signed ** 2) ** 0.5
+        return distance_m, dx_m_signed, dy_m_signed
+
+    # ---- Fallback: pixel-scale estimate (degenerate court detection) ----
     import constants
-    
     court_left = min(court_keypoints[0], court_keypoints[4])
     court_right = max(court_keypoints[2], court_keypoints[6])
     court_top = min(court_keypoints[1], court_keypoints[3])
     court_bottom = max(court_keypoints[5], court_keypoints[7])
-    
+
     court_width_px = court_right - court_left
     court_height_px = court_bottom - court_top
-    
+
     COURT_WIDTH_M = constants.DOUBLE_LINE_WIDTH
     COURT_LENGTH_M = constants.HALF_COURT_LINE_HEIGHT * 2
-    
+
     dx_px = ball_end[0] - ball_start[0]
     dy_px = ball_end[1] - ball_start[1]
-    
-    # Simple conversion
+
     px_per_meter_x = court_width_px / COURT_WIDTH_M
-    dx_m = abs(dx_px) / px_per_meter_x
-    
-    # Light perspective adjustment
-    avg_y = (ball_start[1] + ball_end[1]) / 2
-    y_normalized = (avg_y - court_top) / court_height_px
-    perspective_factor = 1.0 + (y_normalized * 0.10)
-    
-    px_per_meter_y = (court_height_px / COURT_LENGTH_M) * perspective_factor
-    dy_m = abs(dy_px) / px_per_meter_y
-    
-    distance_m = (dx_m**2 + dy_m**2)**0.5
-    
+    px_per_meter_y = court_height_px / COURT_LENGTH_M
+
     dx_m_signed = dx_px / px_per_meter_x
     dy_m_signed = dy_px / px_per_meter_y
-    
+    distance_m = (dx_m_signed ** 2 + dy_m_signed ** 2) ** 0.5
+
     return distance_m, dx_m_signed, dy_m_signed
 
 

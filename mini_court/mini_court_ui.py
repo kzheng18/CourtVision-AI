@@ -11,7 +11,8 @@ from utils import (
     get_closest_keypoint_index,
     get_foot_position,
     get_height_bbox,
-    measure_xy_distance
+    measure_xy_distance,
+    build_court_homography,
 )
 
 class MiniCourt():
@@ -253,24 +254,21 @@ class MiniCourt():
     
     def _build_homography(self, court_keypoints):
         """
-        Compute perspective transform from video court corners to mini court corners.
-        Uses the 4 outer court corners (keypoints 0-3) which define the trapezoid
-        of the full doubles court as seen from the broadcast camera angle.
+        Compute the video-to-mini-court transform from the validated 14-point
+        metric court homography.
         """
-        src = np.float32([
-            [court_keypoints[0], court_keypoints[1]],  # KP 0: far-left corner
-            [court_keypoints[2], court_keypoints[3]],  # KP 1: far-right corner
-            [court_keypoints[4], court_keypoints[5]],  # KP 2: near-left corner
-            [court_keypoints[6], court_keypoints[7]],  # KP 3: near-right corner
-        ])
-        dst = np.float32([
-            [self.drawing_key_points[0], self.drawing_key_points[1]],  # mini top-left
-            [self.drawing_key_points[2], self.drawing_key_points[3]],  # mini top-right
-            [self.drawing_key_points[4], self.drawing_key_points[5]],  # mini bottom-left
-            [self.drawing_key_points[6], self.drawing_key_points[7]],  # mini bottom-right
-        ])
-        H, _ = cv2.findHomography(src, dst)
-        return H
+        image_to_court = build_court_homography(court_keypoints)
+        if image_to_court is None:
+            return None
+
+        mini_width = self.drawing_key_points[2] - self.drawing_key_points[0]
+        mini_height = self.drawing_key_points[5] - self.drawing_key_points[1]
+        court_to_mini = np.array([
+            [mini_width / constants.DOUBLE_LINE_WIDTH, 0.0, self.drawing_key_points[0]],
+            [0.0, mini_height / (constants.HALF_COURT_LINE_HEIGHT * 2), self.drawing_key_points[1]],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        return court_to_mini @ image_to_court
 
     def convert_point_to_mini_court(self, point, original_court_keypoints):
         """
@@ -283,90 +281,50 @@ class MiniCourt():
             self._homography = self._build_homography(original_court_keypoints)
             self._homography_key = key
 
+        if self._homography is None:
+            return None
+
         pt = np.float32([[[point[0], point[1]]]])
         transformed = cv2.perspectiveTransform(pt, self._homography)
         return (int(transformed[0][0][0]), int(transformed[0][0][1]))
     
     def convert_bounding_boxes_to_mini_court_coordinates(self, player_boxes, ball_boxes, original_court_key_points):
-        player_heights = {
-            1: constants.PLAYER_1_HEIGHT_METERS,
-            2: constants.PLAYER_2_HEIGHT_METERS
-        }
-
         output_player_boxes= []
         output_ball_boxes= []
 
+        court_keypoints = np.asarray(original_court_key_points)
+
         for frame_num, player_bbox in enumerate(player_boxes):
-            if 1 not in ball_boxes[frame_num] or not player_bbox:
-                output_player_boxes.append({})
-                output_ball_boxes.append({})
-                continue
-            ball_box = ball_boxes[frame_num][1]
-            ball_position = get_center_bbox(ball_box)
-            closest_player_id_to_ball = min(player_bbox.keys(), key=lambda x: measure_distance(ball_position, get_center_bbox(player_bbox[x])))
+            frame_keypoints = (
+                court_keypoints[min(frame_num, len(court_keypoints) - 1)]
+                if court_keypoints.ndim == 2
+                else court_keypoints
+            )
 
             output_player_bboxes_dict = {}
             for player_id, bbox in player_bbox.items():
                 foot_position = get_foot_position(bbox)
+                mini_position = self.convert_point_to_mini_court(
+                    foot_position,
+                    frame_keypoints,
+                )
+                if mini_position is not None:
+                    output_player_bboxes_dict[player_id] = mini_position
 
-                # Get The closest keypoint in pixels
-                closest_key_point_index = get_closest_keypoint_index(foot_position,original_court_key_points, [0,2,12,13])
-                closest_key_point = (original_court_key_points[closest_key_point_index*2], 
-                                     original_court_key_points[closest_key_point_index*2+1])
-
-                # Get Player height in pixels
-                frame_index_min = max(0, frame_num-20)
-                frame_index_max = min(len(player_boxes), frame_num+50)
-                bboxes_heights_in_pixels = []
-                last_box = None  # last known bbox for this player
-
-                for i in range(frame_index_min, frame_index_max):
-                    frame_dict = player_boxes[i]
-
-                    # If player exists in this frame → update last_box
-                    if player_id in frame_dict:
-                        last_box = frame_dict[player_id]
-
-                    # If still no last_box (player not found yet in interval) → skip safely
-                    if last_box is None:
-                        continue
-
-                    # Use last known bbox for this frame
-                    bboxes_heights_in_pixels.append(get_height_bbox(last_box))
-                max_player_height_in_pixels = max(bboxes_heights_in_pixels)
-
-                mini_court_player_position = self.get_mini_court_coordinates(foot_position,
-                                                                            closest_key_point, 
-                                                                            closest_key_point_index, 
-                                                                            max_player_height_in_pixels,
-                                                                            player_heights[player_id]
-                                                                            )
-                
-                output_player_bboxes_dict[player_id] = mini_court_player_position
-
-                if closest_player_id_to_ball == player_id:
-                    # ✅ USE PERSPECTIVE TRANSFORM FOR BALL (more accurate)
-                    ball_center = get_center_bbox(ball_box)
-                    mini_court_ball_position = self.convert_point_to_mini_court(
-                        ball_center,
-                        original_court_key_points
-                    )
-                    output_ball_boxes.append({1: mini_court_ball_position})
-                    
             output_player_boxes.append(output_player_bboxes_dict)
+
+            output_ball_bbox = {}
+            if frame_num < len(ball_boxes) and 1 in ball_boxes[frame_num]:
+                ball_center = get_center_bbox(ball_boxes[frame_num][1])
+                mini_position = self.convert_point_to_mini_court(
+                    ball_center,
+                    frame_keypoints,
+                )
+                if mini_position is not None:
+                    output_ball_bbox[1] = mini_position
+            output_ball_boxes.append(output_ball_bbox)
         
         return output_player_boxes, output_ball_boxes
-    
-    def add_bounce_position(self, mini_court_position, is_in_bounds):
-        """
-        Add a bounce position to the history.
-        Keep only the last max_bounces_displayed bounces.
-        """
-        self.bounce_positions.append((mini_court_position[0], mini_court_position[1], is_in_bounds))
-        
-        # Keep only last N bounces
-        if len(self.bounce_positions) > self.max_bounces_displayed:
-            self.bounce_positions.pop(0)
     
     def add_bounce_position(self, mini_court_position, is_in_bounds, frame_number):
         """

@@ -120,9 +120,13 @@ def detect_shot_type(ball_detections, start_frame, end_frame, video_fps=50):
         print("      → TOPSPIN\n")
         return "Topspin"
 
-    # 4) Default → TOPSPIN (most shots)
-    print("      → TOPSPIN (default)\n")
-    return "Topspin"
+    # 4) No clear trajectory signature → ABSTAIN.
+    # Spin is not reliably determinable from a single behind-baseline camera
+    # (it needs ball height/rotation this view can't measure), so defaulting to
+    # "Topspin" emitted a confident wrong label on most shots. Returning None is
+    # honest — main.py shows a neutral "Shot" instead of a fabricated spin type.
+    print("      → unclassified (ambiguous trajectory; no confident spin call)\n")
+    return None
 
 
 
