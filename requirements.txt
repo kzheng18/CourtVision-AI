@@ -1,2 +1,7 @@
 ultralytics
 lap
+torch
+torchvision
+opencv-python
+numpy
+pandas
