@@ -19,13 +19,14 @@ python training/train_tracknet.py
 import argparse
 import csv
 import os
+import random
 import sys
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trackers.tracknet import TrackNet, make_gaussian_heatmap
@@ -104,6 +105,36 @@ class TrackNetDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Leak-free train / val split
+# ---------------------------------------------------------------------------
+
+def split_by_blocks(dataset, val_frac=0.15, block=30, seed=42):
+    """
+    Train/val split that holds out CONTIGUOUS blocks of frames.
+
+    random_split leaks: consecutive video frames are near-identical, so putting
+    frame t-1 in train and frame t in val makes the validation set a near-copy
+    of training — the reported val loss is optimistic and hides overfitting.
+
+    Instead we group frames into contiguous blocks (~`block` frames ≈ 0.6 s at
+    50 fps) and assign whole blocks to val, spread across the clip. Adjacent-
+    frame leakage is then limited to the 1–2 frames at each block boundary
+    rather than affecting (potentially) every val sample.
+    """
+    n = len(dataset)
+    n_blocks = max(2, (n + block - 1) // block)
+    block_ids = list(range(n_blocks))
+    random.Random(seed).shuffle(block_ids)
+    n_val_blocks = max(1, int(round(val_frac * n_blocks)))
+    val_blocks = set(block_ids[:n_val_blocks])
+
+    train_idx, val_idx = [], []
+    for i in range(n):
+        (val_idx if (i // block) in val_blocks else train_idx).append(i)
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -119,11 +150,13 @@ def train(args):
     print(f"Device: {device}")
 
     # Dataset ─────────────────────────────────────────────────────────────
-    dataset = TrackNetDataset(args.data_dir)
-    n_val   = max(1, int(0.1 * len(dataset)))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(dataset, [n_train, n_val],
-                                    generator=torch.Generator().manual_seed(42))
+    dataset = TrackNetDataset(args.data_dir, input_h=args.input_h,
+                              input_w=args.input_w, sigma=args.sigma)
+    train_ds, val_ds = split_by_blocks(dataset, val_frac=args.val_frac,
+                                       block=args.block, seed=42)
+    n_train, n_val = len(train_ds), len(val_ds)
+    print(f"Resolution {args.input_w}x{args.input_h}, sigma {args.sigma} | "
+          f"leak-free block split (block={args.block})")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
                               num_workers=0, pin_memory=(device == 'cuda'))
@@ -185,7 +218,12 @@ def train(args):
         # Save best ────────────────────────────────────────────────────
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({'model': model.state_dict()}, args.save_path)
+            # Record the training resolution so TrackNetDetector preprocesses
+            # inference frames at the SAME size the model was trained on.
+            torch.save({'model': model.state_dict(),
+                        'input_h': args.input_h,
+                        'input_w': args.input_w,
+                        'sigma': args.sigma}, args.save_path)
             print(f"  ✓ Saved best model → {args.save_path}")
 
     print(f"\nTraining complete. Best val loss: {best_val_loss:.5f}")
@@ -204,6 +242,19 @@ if __name__ == '__main__':
     p.add_argument('--batch',      type=int,   default=4)
     p.add_argument('--lr',         type=float, default=1e-4)
     p.add_argument('--device',     default='',  help='force device: cpu, mps, cuda')
+    # Retrain-at-higher-resolution knobs (defaults = current 360x640 model)
+    p.add_argument('--input_h', type=int, default=360,
+                   help='training input height; use 720 for the hi-res retrain')
+    p.add_argument('--input_w', type=int, default=640,
+                   help='training input width; use 1280 for the hi-res retrain')
+    p.add_argument('--sigma', type=float, default=10.0,
+                   help='Gaussian target sigma in px AT THE TRAINING RESOLUTION. '
+                        'Keep it ~1-1.5x the ball radius; do NOT scale it up with '
+                        'resolution (a larger sigma teaches a blob, not a point).')
+    p.add_argument('--val_frac', type=float, default=0.15,
+                   help='fraction of blocks held out for validation')
+    p.add_argument('--block', type=int, default=30,
+                   help='frames per contiguous block for the leak-free split')
     args = p.parse_args()
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
