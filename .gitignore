@@ -44,5 +44,6 @@ credentials.json
 *.swo
 Thumbs.db
 
-# ── Claude Code session files ─────────────────────────────────────────────────
-.claude/
+
+# Python venv
+.venv/
