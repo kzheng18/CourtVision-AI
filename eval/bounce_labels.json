@@ -1,0 +1,16 @@
+{
+  "_comment": "Visual ground-truth bounce calls for input_video_h264.mp4, labelled by inspecting eval/bounce_montages/ frame-by-frame. Keyed by shot-interval start frame. 'unresolvable' = the bounce frame/IN-OUT cannot be determined from this single behind-baseline camera (net crossing, tracking jump, or far-baseline call at the resolution limit).",
+  "clip": "input_video/input_video_h264.mp4",
+  "labels": {
+    "120": {"call": "IN",  "note": "near-court, ball clearly inside lines"},
+    "191": {"call": "IN",  "note": "mid-court service area, ball visible IN"},
+    "304": {"call": "IN",  "note": "CLOSE - lands on/just inside far baseline, borderline"},
+    "168": {"call": "unresolvable", "note": "tracking jump 12.6->21.8m"},
+    "220": {"call": "unresolvable", "note": "far player, tracking jumps across court"},
+    "246": {"call": "unresolvable", "note": "net crossing, tracking jumps"},
+    "352": {"call": "unresolvable", "note": "static-lock artifact near net"},
+    "377": {"call": "unresolvable", "note": "near-player hit vs bounce ambiguous (tracking clean though)"},
+    "404": {"call": "unresolvable", "note": "net crossing, ambiguous"},
+    "449": {"call": "unresolvable", "note": "far-baseline close call at resolution limit"}
+  }
+}
