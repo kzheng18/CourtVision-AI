@@ -99,7 +99,8 @@ class TrackNetDetector:
     # → list of {1: [x1,y1,x2,y2]} or {} per frame, same format as BallTracker
     """
 
-    def __init__(self, model_path, confidence=0.5, device=None):
+    def __init__(self, model_path, confidence=0.5, device=None,
+                 input_h=None, input_w=None):
         self.confidence = confidence
         if device:
             self.device = device
@@ -110,16 +111,25 @@ class TrackNetDetector:
         else:
             self.device = 'cpu'
 
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
+        # accept both a raw state-dict and a {"model": ..., "input_h": ...} checkpoint
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            state = checkpoint['model']
+            ckpt_h = checkpoint.get('input_h')
+            ckpt_w = checkpoint.get('input_w')
+        else:
+            state = checkpoint
+            ckpt_h = ckpt_w = None
+
+        # Inference must preprocess frames at the resolution the model was
+        # trained on. Priority: explicit arg > value saved in the checkpoint >
+        # the legacy 360x640 default (for models saved before this was tracked).
+        self._iH = int(input_h or ckpt_h or TrackNet.INPUT_H)
+        self._iW = int(input_w or ckpt_w or TrackNet.INPUT_W)
+
         self.model = TrackNet().to(self.device)
-        state = torch.load(model_path, map_location=self.device, weights_only=True)
-        # accept both raw state-dict and {"model": state_dict} checkpoints
-        if 'model' in state:
-            state = state['model']
         self.model.load_state_dict(state)
         self.model.eval()
-
-        self._iH = TrackNet.INPUT_H
-        self._iW = TrackNet.INPUT_W
 
     # ------------------------------------------------------------------
     # Public API
@@ -166,16 +176,37 @@ class TrackNetDetector:
         tensor = torch.from_numpy(stacked).permute(2, 0, 1)  # (9, iH, iW)
         return tensor.unsqueeze(0).to(self.device)            # (1, 9, iH, iW)
 
-    def _heatmap_to_bbox(self, heatmap, orig_h, orig_w, box_radius=10):
+    def _heatmap_to_bbox(self, heatmap, orig_h, orig_w, box_radius=10, win=2):
         peak = float(heatmap.max())
         if peak < self.confidence:
             return None
 
         iy, ix = np.unravel_index(np.argmax(heatmap), heatmap.shape)
 
+        # Sub-pixel refinement: intensity-weighted centroid over a
+        # (2*win+1)^2 window around the peak. Plain argmax snaps to the
+        # 640x360 model grid, a ~2-3px quantization once scaled to the
+        # original frame — enough to bias bounce-Y and ball speed. The
+        # centroid recovers fractional position at no extra model cost.
+        y0, y1 = max(0, iy - win), min(heatmap.shape[0], iy + win + 1)
+        x0, x1 = max(0, ix - win), min(heatmap.shape[1], ix + win + 1)
+        patch = heatmap[y0:y1, x0:x1]
+
+        # Subtract half the peak so the near-zero background tail doesn't
+        # drag the centroid toward the window edges.
+        weights = np.clip(patch - 0.5 * peak, 0.0, None)
+        total = float(weights.sum())
+        if total > 0.0:
+            ys = np.arange(y0, y1, dtype=np.float32).reshape(-1, 1)
+            xs = np.arange(x0, x1, dtype=np.float32).reshape(1, -1)
+            sub_iy = float((weights * ys).sum() / total)
+            sub_ix = float((weights * xs).sum() / total)
+        else:
+            sub_iy, sub_ix = float(iy), float(ix)
+
         # scale back to original frame coordinates
-        cx = (ix / self._iW) * orig_w
-        cy = (iy / self._iH) * orig_h
+        cx = (sub_ix / self._iW) * orig_w
+        cy = (sub_iy / self._iH) * orig_h
 
         r = box_radius
         return [cx - r, cy - r, cx + r, cy + r]
